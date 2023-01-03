@@ -3,10 +3,6 @@ OPT_FAST=-O3 -DHTTP_PARSER_STRICT=0 -I.
 
 CC?=gcc
 
-
-test: test_g
-	./test_g
-
 test_g: http_parser_g.o test_g.o
 	$(CC) $(OPT_DEBUG) http_parser_g.o test_g.o -o $@
 

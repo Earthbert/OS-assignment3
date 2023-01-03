@@ -156,7 +156,7 @@ static inline int w_epoll_update_ptr_inout(int epollfd, int fd, void *ptr)
 	return epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &ev);
 }
 
-static inline int w_epoll_remove_ptr(int epollfd, int fd, void *ptr)
+static inline int   w_epoll_remove_ptr(int epollfd, int fd, void *ptr)
 {
 	struct epoll_event ev;
 
