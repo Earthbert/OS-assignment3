@@ -6,6 +6,7 @@ CFLAGS = -Wall -g -I..
 all: aws
 
 aws: aws.o ./util/http-parser/http_parser.o sock_util.o w_epoll.h
+	gcc $(CPPFLAG) $(CFLAGS) aws.o sock_util.o ./util/http-parser/http_parser.o -o aws -laio
 
 sock_util.o: sock_util.c sock_util.h
 

@@ -1,8 +1,13 @@
 #include <stdlib.h>
-
 #include <sys/sendfile.h>
 #include <sys/epoll.h>
 #include <libaio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <assert.h>
+#include <mqueue.h>
+#include <sys/stat.h>
+#include <sys/eventfd.h>
 
 #include "util/http-parser/http_parser.h"
 #include "util/util.h"
@@ -10,11 +15,6 @@
 #include "w_epoll.h"
 #include "sock_util.h"
 #include "util/debug.h"
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <assert.h>
-#include <mqueue.h>
-#include <sys/stat.h>
 
 /* server socket file descriptor */
 static int listenfd;
@@ -29,8 +29,14 @@ enum connection_state {
     STATE_WAITING_FOR_DATA,
     STATE_RECEIVING_DATA,
     STATE_DATA_RECEIVED,
+    STATE_SENDING_DATA,
     STATE_DATA_SENT,
     STATE_CONNECTION_CLOSED
+};
+
+enum request_type {
+    TYPE_STATIC,
+    TYPE_DYNAMIC
 };
 
 /* structure acting as a connection handler */
@@ -47,6 +53,11 @@ struct connection {
     struct stat req_stat;
     ssize_t file_send_bytes;
     ssize_t send_bytes;
+    enum request_type type;
+    int event_fd;
+    char *file_buffer;
+    io_context_t aio_ctx;
+    struct iocb *iocb;
 };
 
 typedef struct connection connection_t;
@@ -91,6 +102,11 @@ static void handle_received_http_request(connection_t *conn) {
         dlog(LOG_ERR, "Cannot open file %s\n", conn->path)
     } else {
         fstat(conn->req_fd, &(conn->req_stat));
+        if (strstr(conn->path, AWS_REL_STATIC_FOLDER)) {
+            conn->type = TYPE_STATIC;
+        } else {
+            conn->type = TYPE_DYNAMIC;
+        }
     }
 }
 
@@ -130,12 +146,13 @@ static void connection_remove(struct connection *conn) {
     DIE(rc < 0, "w_epoll_remove_ptr\n");
     close(conn->sockfd);
     close(conn->req_fd);
+    close(conn->event_fd);
     conn->state = STATE_CONNECTION_CLOSED;
     free(conn);
 }
 
 static enum connection_state receive_message(connection_t *conn) {
-    ssize_t bytes_recv = 0;
+    ssize_t bytes_recv;
     int rc;
     char addr_buffer[64];
 
@@ -147,11 +164,11 @@ static enum connection_state receive_message(connection_t *conn) {
 
     bytes_recv = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ, 0);
     if (bytes_recv < 0) {        /* error in communication */
-        dlog(LOG_ERR, "Error in communication from: %s\n", addr_buffer);
+        dlog(LOG_ERR, "Error in communication from: %s\n", addr_buffer)
         goto remove_connection;
     }
     if (bytes_recv == 0) {        /* connection closed */
-        dlog(LOG_INFO, "Connection closed from: %s\n", addr_buffer);
+        dlog(LOG_INFO, "Connection closed from: %s\n", addr_buffer)
         goto remove_connection;
     }
 
@@ -200,11 +217,25 @@ static void prepare_send_message(struct connection *conn) {
     }
 }
 
+static void prepare_for_aio(connection_t *conn) {
+    conn->file_buffer = calloc(1, conn->req_stat.st_size);
+    conn->event_fd = eventfd(0, 0);
+    conn->iocb = calloc(1, sizeof(*conn->iocb));
+    io_prep_pread(conn->iocb, conn->req_fd, conn->file_buffer, conn->req_stat.st_size, 0);
+    io_set_eventfd(conn->iocb, conn->event_fd);
+    int rc = w_epoll_add_ptr_in(epollfd, conn->event_fd, conn);
+    DIE(rc < 0, "w_epoll_add_ptr_in");
+    rc = io_setup(1, &conn->aio_ctx);
+    DIE(rc < 0, "io_setup");
+    rc = io_submit(conn->aio_ctx, 1, &conn->iocb);
+    DIE(rc < 0, "io_submit");
+}
+
 /*
  * Send message on socket.
  * Store message in send_buffer in struct connection.
  */
-static void send_message(struct connection *conn) {
+static void  send_message(connection_t *conn) {
     ssize_t bytes_sent;
     int rc;
     char addr_buffer[64];
@@ -215,8 +246,12 @@ static void send_message(struct connection *conn) {
         goto remove_connection;
     }
 
-    prepare_send_message(conn);
+    if (conn->state == STATE_DATA_RECEIVED) {
+        prepare_send_message(conn);
+    }
+
     if (conn->send_bytes < conn->send_len) {
+        conn->state = STATE_SENDING_DATA;
         bytes_sent = send(conn->sockfd, conn->send_buffer + conn->send_bytes, conn->send_len - conn->send_bytes, 0);
         conn->send_bytes += bytes_sent;
         if (bytes_sent < 0) {        /* error in communication */
@@ -232,10 +267,25 @@ static void send_message(struct connection *conn) {
         return;
     }
 
-    if (conn->file_send_bytes < conn->req_stat.st_size) {
-        dlog(LOG_INFO, "Now sending data from file\n")
-        conn->file_send_bytes += sendfile(conn->sockfd, conn->req_fd, 0, conn->req_stat.st_size);
-        return;
+    if (conn->type == TYPE_STATIC) {
+        if (conn->file_send_bytes < conn->req_stat.st_size) {
+            dlog(LOG_INFO, "Sending data from file to %s\n", addr_buffer)
+            conn->file_send_bytes += sendfile(conn->sockfd, conn->req_fd, 0, conn->req_stat.st_size);
+            return;
+        }
+    } else if (conn->type == TYPE_DYNAMIC){
+        if (conn->event_fd == 0) {
+            prepare_for_aio(conn);
+            return;
+        } else if (conn->file_send_bytes < conn->req_stat.st_size) {
+            ssize_t bytes_send;
+            bytes_send = send(conn->sockfd, conn->file_buffer, conn->req_stat.st_size - conn->file_send_bytes, 0);
+            dlog(LOG_INFO, "Sending data from file to %s:\n", addr_buffer)
+            conn->file_send_bytes += bytes_send;
+            return;
+        } else if (conn->file_send_bytes >= conn->req_stat.st_size) {
+            io_destroy(conn->aio_ctx);
+        }
     }
 
     /* all done - remove out notification */
