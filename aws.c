@@ -30,6 +30,7 @@ enum connection_state {
     STATE_RECEIVING_DATA,
     STATE_DATA_RECEIVED,
     STATE_DATA_SENT,
+    STATE_SENDING_DATA,
     STATE_CONNECTION_CLOSED
 };
 
@@ -41,12 +42,17 @@ struct connection {
     size_t recv_len;
     char send_buffer[BUFSIZ];
     size_t send_len;
+    /* state of connection */
     enum connection_state state;
+    /* path of requested file */
     char path[BUFSIZ];
+    /* file descriptor and info of requested file */
     int req_fd;
     struct stat req_stat;
-    ssize_t file_send_bytes;
+    /* nr of bytes from http header send */
     ssize_t send_bytes;
+    /* nr of bytes of requested file send */
+    ssize_t file_send_bytes;
 };
 
 typedef struct connection connection_t;
@@ -76,6 +82,9 @@ static http_parser_settings settings_on_path = {
         /* on_message_complete */ 0
 };
 
+/*
+ * Parse http request and store information about it in connection struct
+ */
 static void handle_received_http_request(connection_t *conn) {
     http_parser_init(&request_parser, HTTP_REQUEST);
 
@@ -94,6 +103,9 @@ static void handle_received_http_request(connection_t *conn) {
     }
 }
 
+/*
+ * Initialize connection structure on given socket.
+ */
 static connection_t *connection_create(int sockfd) {
     connection_t *conn = calloc(1, sizeof(*conn));
     DIE(!conn, "calloc\n");
@@ -103,6 +115,21 @@ static connection_t *connection_create(int sockfd) {
     return conn;
 }
 
+/*
+ * Remove connection handler.
+ */
+static void connection_remove(struct connection *conn) {
+    int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+    DIE(rc < 0, "w_epoll_remove_ptr\n");
+    close(conn->sockfd);
+    close(conn->req_fd);
+    conn->state = STATE_CONNECTION_CLOSED;
+    free(conn);
+}
+
+/*
+ * Handle a client request on a client connection.
+ */
 static void handle_new_connection(void) {
     int sockfd;
     socklen_t addrlen = sizeof(struct sockaddr_in);
@@ -125,17 +152,12 @@ static void handle_new_connection(void) {
     DIE(rc < 0, "w_epoll_add_in\n");
 }
 
-static void connection_remove(struct connection *conn) {
-    int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-    DIE(rc < 0, "w_epoll_remove_ptr\n");
-    close(conn->sockfd);
-    close(conn->req_fd);
-    conn->state = STATE_CONNECTION_CLOSED;
-    free(conn);
-}
-
+/*
+ * Receive message on socket.
+ * Store message in recv_buffer in struct connection.
+ */
 static enum connection_state receive_message(connection_t *conn) {
-    ssize_t bytes_recv = 0;
+    ssize_t bytes_recv;
     int rc;
     char addr_buffer[64];
 
@@ -147,11 +169,11 @@ static enum connection_state receive_message(connection_t *conn) {
 
     bytes_recv = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ, 0);
     if (bytes_recv < 0) {        /* error in communication */
-        dlog(LOG_ERR, "Error in communication from: %s\n", addr_buffer);
+        dlog(LOG_ERR, "Error in communication from: %s\n", addr_buffer)
         goto remove_connection;
     }
     if (bytes_recv == 0) {        /* connection closed */
-        dlog(LOG_INFO, "Connection closed from: %s\n", addr_buffer);
+        dlog(LOG_INFO, "Connection closed from: %s\n", addr_buffer)
         goto remove_connection;
     }
 
@@ -173,6 +195,9 @@ static enum connection_state receive_message(connection_t *conn) {
     return STATE_CONNECTION_CLOSED;
 }
 
+/*
+ * Handle a client request on a client connection.
+ */
 static void handle_client_request(struct connection *conn) {
     enum connection_state ret_state;
 
@@ -190,6 +215,9 @@ static void handle_client_request(struct connection *conn) {
     }
 }
 
+/*
+ * Prepare http header and store it in send_buffer
+ */
 static void prepare_send_message(struct connection *conn) {
     if (conn->req_fd == -1) {
         strcpy(conn->send_buffer, "HTTP/1.0 404 File no here\r\n\r\n");
@@ -215,8 +243,12 @@ static void send_message(struct connection *conn) {
         goto remove_connection;
     }
 
-    prepare_send_message(conn);
+    if (conn->state == STATE_DATA_RECEIVED) {
+        prepare_send_message(conn);
+    }
+
     if (conn->send_bytes < conn->send_len) {
+        conn->state = STATE_SENDING_DATA;
         bytes_sent = send(conn->sockfd, conn->send_buffer + conn->send_bytes, conn->send_len - conn->send_bytes, 0);
         conn->send_bytes += bytes_sent;
         if (bytes_sent < 0) {        /* error in communication */
