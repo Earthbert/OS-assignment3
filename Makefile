@@ -1,9 +1,9 @@
-CPPFLAGS = -DDEBUG -DLOG_LEVEL=LOG_DEBUG
+CPPFLAGS = #-DDEBUG -DLOG_LEVEL=LOG_DEBUG
 CFLAGS = -Wall -g -I..
 
 .PHONY: all clean
 
-all: aws
+build: aws
 
 aws: aws.o ./util/http-parser/http_parser.o sock_util.o w_epoll.h
 
@@ -16,3 +16,4 @@ clean:
 	-rm -f *~
 	-rm -f *.o
 	-rm -f test_get_request_path
+	-rm aws

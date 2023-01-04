@@ -140,6 +140,7 @@ static void handle_new_connection(void) {
     /* accept new connection */
     sockfd = accept(listenfd, (SSA *) &addr, &addrlen);
     DIE(sockfd < 0, "accept\n");
+    fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK);
 
     dlog(LOG_INFO, "Accepted connection from: %s:%d\n",
          inet_ntoa(addr.sin_addr), ntohs(addr.sin_port))
