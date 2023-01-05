@@ -1,13 +1,8 @@
 #include <stdlib.h>
+
 #include <sys/sendfile.h>
 #include <sys/epoll.h>
 #include <libaio.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <assert.h>
-#include <mqueue.h>
-#include <sys/stat.h>
-#include <sys/eventfd.h>
 
 #include "util/http-parser/http_parser.h"
 #include "util/util.h"
@@ -15,6 +10,12 @@
 #include "w_epoll.h"
 #include "sock_util.h"
 #include "util/debug.h"
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <assert.h>
+#include <mqueue.h>
+#include <sys/stat.h>
+#include <sys/eventfd.h>
 
 /* server socket file descriptor */
 static int listenfd;
@@ -25,18 +26,19 @@ static int epollfd;
 static http_parser request_parser;
 static char request_path[BUFSIZ];    /* storage for request_path */
 
+enum request_type {
+    TYPE_STATIC,
+    TYPE_DYNAMIC
+};
+
 enum connection_state {
     STATE_WAITING_FOR_DATA,
     STATE_RECEIVING_DATA,
     STATE_DATA_RECEIVED,
-    STATE_SENDING_DATA,
     STATE_DATA_SENT,
-    STATE_CONNECTION_CLOSED
-};
-
-enum request_type {
-    TYPE_STATIC,
-    TYPE_DYNAMIC
+    STATE_SENDING_DATA,
+    STATE_CONNECTION_CLOSED,
+    STATE_DYNAMIC_SENDING
 };
 
 /* structure acting as a connection handler */
@@ -47,12 +49,17 @@ struct connection {
     size_t recv_len;
     char send_buffer[BUFSIZ];
     size_t send_len;
+    /* state of connection */
     enum connection_state state;
+    /* path of requested file */
     char path[BUFSIZ];
+    /* file descriptor and info of requested file */
     int req_fd;
     struct stat req_stat;
-    ssize_t file_send_bytes;
+    /* nr of bytes from http header send */
     ssize_t send_bytes;
+    /* nr of bytes of requested file send */
+    ssize_t file_send_bytes;
     enum request_type type;
     int event_fd;
     char *file_buffer;
@@ -87,6 +94,9 @@ static http_parser_settings settings_on_path = {
         /* on_message_complete */ 0
 };
 
+/*
+ * Parse http request and store information about it in connection struct
+ */
 static void handle_received_http_request(connection_t *conn) {
     http_parser_init(&request_parser, HTTP_REQUEST);
 
@@ -110,6 +120,9 @@ static void handle_received_http_request(connection_t *conn) {
     }
 }
 
+/*
+ * Initialize connection structure on given socket.
+ */
 static connection_t *connection_create(int sockfd) {
     connection_t *conn = calloc(1, sizeof(*conn));
     DIE(!conn, "calloc\n");
@@ -119,6 +132,21 @@ static connection_t *connection_create(int sockfd) {
     return conn;
 }
 
+/*
+ * Remove connection handler.
+ */
+static void connection_remove(struct connection *conn) {
+    int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+    DIE(rc < 0, "w_epoll_remove_ptr\n");
+    close(conn->sockfd);
+    close(conn->req_fd);
+    conn->state = STATE_CONNECTION_CLOSED;
+    free(conn);
+}
+
+/*
+ * Handle a client request on a client connection.
+ */
 static void handle_new_connection(void) {
     int sockfd;
     socklen_t addrlen = sizeof(struct sockaddr_in);
@@ -129,6 +157,7 @@ static void handle_new_connection(void) {
     /* accept new connection */
     sockfd = accept(listenfd, (SSA *) &addr, &addrlen);
     DIE(sockfd < 0, "accept\n");
+    fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK);
 
     dlog(LOG_INFO, "Accepted connection from: %s:%d\n",
          inet_ntoa(addr.sin_addr), ntohs(addr.sin_port))
@@ -141,16 +170,10 @@ static void handle_new_connection(void) {
     DIE(rc < 0, "w_epoll_add_in\n");
 }
 
-static void connection_remove(struct connection *conn) {
-    int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-    DIE(rc < 0, "w_epoll_remove_ptr\n");
-    close(conn->sockfd);
-    close(conn->req_fd);
-    close(conn->event_fd);
-    conn->state = STATE_CONNECTION_CLOSED;
-    free(conn);
-}
-
+/*
+ * Receive message on socket.
+ * Store message in recv_buffer in struct connection.
+ */
 static enum connection_state receive_message(connection_t *conn) {
     ssize_t bytes_recv;
     int rc;
@@ -190,6 +213,9 @@ static enum connection_state receive_message(connection_t *conn) {
     return STATE_CONNECTION_CLOSED;
 }
 
+/*
+ * Handle a client request on a client connection.
+ */
 static void handle_client_request(struct connection *conn) {
     enum connection_state ret_state;
 
@@ -207,6 +233,9 @@ static void handle_client_request(struct connection *conn) {
     }
 }
 
+/*
+ * Prepare http header and store it in send_buffer
+ */
 static void prepare_send_message(struct connection *conn) {
     if (conn->req_fd == -1) {
         strcpy(conn->send_buffer, "HTTP/1.0 404 File no here\r\n\r\n");
@@ -219,13 +248,9 @@ static void prepare_send_message(struct connection *conn) {
 
 static void prepare_for_aio(connection_t *conn) {
     conn->file_buffer = calloc(1, conn->req_stat.st_size);
-    conn->event_fd = eventfd(0, 0);
     conn->iocb = calloc(1, sizeof(*conn->iocb));
     io_prep_pread(conn->iocb, conn->req_fd, conn->file_buffer, conn->req_stat.st_size, 0);
-    io_set_eventfd(conn->iocb, conn->event_fd);
-    int rc = w_epoll_add_ptr_in(epollfd, conn->event_fd, conn);
-    DIE(rc < 0, "w_epoll_add_ptr_in");
-    rc = io_setup(1, &conn->aio_ctx);
+    int rc = io_setup(1, &conn->aio_ctx);
     DIE(rc < 0, "io_setup");
     rc = io_submit(conn->aio_ctx, 1, &conn->iocb);
     DIE(rc < 0, "io_submit");
@@ -273,26 +298,32 @@ static void  send_message(connection_t *conn) {
             conn->file_send_bytes += sendfile(conn->sockfd, conn->req_fd, 0, conn->req_stat.st_size);
             return;
         }
-    } else if (conn->type == TYPE_DYNAMIC){
-        if (conn->event_fd == 0) {
+    } else if (conn->type == TYPE_DYNAMIC) {
+        if (conn->state == STATE_SENDING_DATA) {
             prepare_for_aio(conn);
+            conn->state = STATE_DYNAMIC_SENDING;
             return;
-        } else if (conn->file_send_bytes < conn->req_stat.st_size) {
-            ssize_t bytes_send;
-            bytes_send = send(conn->sockfd, conn->file_buffer, conn->req_stat.st_size - conn->file_send_bytes, 0);
-            dlog(LOG_INFO, "Sending data from file to %s:\n", addr_buffer)
-            conn->file_send_bytes += bytes_send;
+        } else if (conn->state == STATE_DYNAMIC_SENDING) {
+            struct io_event io_event;
+            if (io_getevents(conn->aio_ctx, 1, 1, &io_event, NULL)) {
+                io_prep_pwrite(conn->iocb, conn->sockfd, conn->file_buffer, conn->req_stat.st_size, 0);
+                rc = io_submit(conn->aio_ctx, 1, &conn->iocb);
+                DIE(rc < 0, "io_submit");
+                dlog(LOG_INFO, "Sending data from file to %s:\n", addr_buffer)
+                conn->state = STATE_DATA_SENT;
+            }
             return;
-        } else if (conn->file_send_bytes >= conn->req_stat.st_size) {
-            io_destroy(conn->aio_ctx);
+        } else {
+            struct io_event io_event;
+            if (io_getevents(conn->aio_ctx, 1, 1, &io_event, NULL)) {
+                io_destroy(conn->aio_ctx);
+            }
         }
     }
 
     /* all done - remove out notification */
     rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
     DIE(rc < 0, "w_epoll_update_ptr_in\n");
-
-    conn->state = STATE_DATA_SENT;
 
     dlog(LOG_INFO, "Finished sending data, closing connection\n")
 

@@ -17,3 +17,4 @@ clean:
 	-rm -f *~
 	-rm -f *.o
 	-rm -f test_get_request_path
+	-rm aws
