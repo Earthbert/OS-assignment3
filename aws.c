@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <mqueue.h>
 #include <sys/stat.h>
+#include <sys/eventfd.h>
 
 /* server socket file descriptor */
 static int listenfd;
@@ -25,13 +26,19 @@ static int epollfd;
 static http_parser request_parser;
 static char request_path[BUFSIZ];    /* storage for request_path */
 
+enum request_type {
+    TYPE_STATIC,
+    TYPE_DYNAMIC
+};
+
 enum connection_state {
     STATE_WAITING_FOR_DATA,
     STATE_RECEIVING_DATA,
     STATE_DATA_RECEIVED,
     STATE_DATA_SENT,
     STATE_SENDING_DATA,
-    STATE_CONNECTION_CLOSED
+    STATE_CONNECTION_CLOSED,
+    STATE_DYNAMIC_SENDING
 };
 
 /* structure acting as a connection handler */
@@ -53,6 +60,11 @@ struct connection {
     ssize_t send_bytes;
     /* nr of bytes of requested file send */
     ssize_t file_send_bytes;
+    enum request_type type;
+    int event_fd;
+    char *file_buffer;
+    io_context_t aio_ctx;
+    struct iocb *iocb;
 };
 
 typedef struct connection connection_t;
@@ -100,6 +112,11 @@ static void handle_received_http_request(connection_t *conn) {
         dlog(LOG_ERR, "Cannot open file %s\n", conn->path)
     } else {
         fstat(conn->req_fd, &(conn->req_stat));
+        if (strstr(conn->path, AWS_REL_STATIC_FOLDER)) {
+            conn->type = TYPE_STATIC;
+        } else {
+            conn->type = TYPE_DYNAMIC;
+        }
     }
 }
 
@@ -229,11 +246,21 @@ static void prepare_send_message(struct connection *conn) {
     }
 }
 
+static void prepare_for_aio(connection_t *conn) {
+    conn->file_buffer = calloc(1, conn->req_stat.st_size);
+    conn->iocb = calloc(1, sizeof(*conn->iocb));
+    io_prep_pread(conn->iocb, conn->req_fd, conn->file_buffer, conn->req_stat.st_size, 0);
+    int rc = io_setup(1, &conn->aio_ctx);
+    DIE(rc < 0, "io_setup");
+    rc = io_submit(conn->aio_ctx, 1, &conn->iocb);
+    DIE(rc < 0, "io_submit");
+}
+
 /*
  * Send message on socket.
  * Store message in send_buffer in struct connection.
  */
-static void send_message(struct connection *conn) {
+static void  send_message(connection_t *conn) {
     ssize_t bytes_sent;
     int rc;
     char addr_buffer[64];
@@ -265,17 +292,38 @@ static void send_message(struct connection *conn) {
         return;
     }
 
-    if (conn->file_send_bytes < conn->req_stat.st_size) {
-        dlog(LOG_INFO, "Now sending data from file\n")
-        conn->file_send_bytes += sendfile(conn->sockfd, conn->req_fd, 0, conn->req_stat.st_size);
-        return;
+    if (conn->type == TYPE_STATIC) {
+        if (conn->file_send_bytes < conn->req_stat.st_size) {
+            dlog(LOG_INFO, "Sending data from file to %s\n", addr_buffer)
+            conn->file_send_bytes += sendfile(conn->sockfd, conn->req_fd, 0, conn->req_stat.st_size);
+            return;
+        }
+    } else if (conn->type == TYPE_DYNAMIC) {
+        if (conn->state == STATE_SENDING_DATA) {
+            prepare_for_aio(conn);
+            conn->state = STATE_DYNAMIC_SENDING;
+            return;
+        } else if (conn->state == STATE_DYNAMIC_SENDING) {
+            struct io_event io_event;
+            if (io_getevents(conn->aio_ctx, 1, 1, &io_event, NULL)) {
+                io_prep_pwrite(conn->iocb, conn->sockfd, conn->file_buffer, conn->req_stat.st_size, 0);
+                rc = io_submit(conn->aio_ctx, 1, &conn->iocb);
+                DIE(rc < 0, "io_submit");
+                dlog(LOG_INFO, "Sending data from file to %s:\n", addr_buffer)
+                conn->state = STATE_DATA_SENT;
+            }
+            return;
+        } else {
+            struct io_event io_event;
+            if (io_getevents(conn->aio_ctx, 1, 1, &io_event, NULL)) {
+                io_destroy(conn->aio_ctx);
+            }
+        }
     }
 
     /* all done - remove out notification */
     rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
     DIE(rc < 0, "w_epoll_update_ptr_in\n");
-
-    conn->state = STATE_DATA_SENT;
 
     dlog(LOG_INFO, "Finished sending data, closing connection\n")
 
